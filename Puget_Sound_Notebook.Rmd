@@ -1,0 +1,804 @@
+---
+title: "Puget Sound Downscaling"
+output: html_notebook
+---
+
+Loading files
+```{r warning=TRUE}
+source("libraries.R")
+source("map_Puget_Sound.R")
+source("get_nc.R")
+source("get_historical_nc.R")
+source("combine_ncfiles.R")
+source("regrid_ncfiles.R")
+source("climatology_nc.R")
+source("calc_anomaly.R")
+source("interpolate_nc.R")
+source("overlay_anomaly.R")
+source("plot_interpolated_SST_anomaly.R")
+#commented because it is a script and not a function
+#source("plot_nc.R")
+```
+
+Creating Puget Sound Map
+```{r}
+make_map(shape.file = "~/Puget_Sound_Downscaling/Atlantis_shapefile/bgm_Puget_Sound_89b_0p0001_WGS84.shp", basin.shapefile = "~/Puget_Sound_Downscaling/repsbasin_shapefile/shapefile_4071.shp", file.name = "puget_sound_map.jpg", scale.factor = 1, arrow.position = "tr", min.long = -124.555, max.long = -121.9, min.lat = 46.9936, max.lat = 48.957)
+```
+
+Downloading initial files to test resolution
+```{r}
+model.list = c("HadGEM3-GC31-LL","EC-Earth3", "MRI-ESM2-0", "NorESM2-LM", "NorESM2-MM", "CMCC-CM2-SR5", "AWI-CM-1-1-MR")
+lapply(model.list, get_nc)
+system("az vm deallocate --name atlantisserver01 --no-wait --resource-group morzariacedogroup")
+
+#get_nc(model.name = "AWI-CM-1-1-MR")
+
+```
+
+Downloading more files to test resolution
+- These are higher resolution models that didn't run all as many ScenarioMIPs, so they were downloaded using ssp245
+```{r}
+model.list2 = c("GFDL-CM4", "GFDL-ESM2M", "CMCC-CM2-SR5")
+lapply(model.list2, get_nc)
+system("az vm deallocate --name atlantisserver01 --no-wait --resource-group morzariacedogroup")
+
+```
+
+Downloading even more files to test resolution
+-GFDL and CMCC but with monthly data
+```{r}
+model.list3 = c("GFDL-CM4", "CMCC-CM2-SR5")
+lapply(model.list3, get_nc)
+system("az vm deallocate --name atlantisserver01 --no-wait --resource-group morzariacedogroup")
+```
+
+Plotting model resolutions
+```{r}
+setwd("~/Puget_Sound_Downscaling/plotting_models/")
+
+source("plot_AWI-CM-1-1-MR.R")
+source("plot_CNRM-CM6-1-HR.R")
+source("plot_GDFL-CM4.R")
+
+```
+
+
+Download SST data for all scenarios
+```{r}
+model.list.download  <- c("GFDL-CM4", "CNRM-CM6-1-HR")
+#model.list.download  <- c("CNRM-CM6-1-HR")
+
+#sets working directory
+setwd("~/Puget_Sound_Downscaling/data_files/")
+
+#ScenarioMIP
+
+data.cimp6.sc <- lapply(model.list.download, get_nc, model.var = "tos") %>% 
+  bind_rows
+
+#Historical data
+#salinity is "sos"
+data.cimp6.hist <- lapply(model.list.download, get_historical_nc, model.var = "tos") %>% 
+  bind_rows
+
+data.cimp6.table <- bind_rows(data.cimp6.hist, data.cimp6.sc)
+
+write_csv(data.cimp6.table, "data_cimp6_table.csv")
+                              
+system("az vm deallocate --name atlantisserver01 --no-wait --resource-group morzariacedogroup")
+
+```
+
+
+Download salinity data for all scenarios
+```{r}
+model.list.download  <- c("GFDL-CM4", "CNRM-CM6-1-HR")
+#model.list.download  <- c("CNRM-CM6-1-HR")
+
+#sets working directory
+setwd("~/Puget_Sound_Downscaling/data_files/")
+
+#ScenarioMIP
+#salinity is "sos"
+data.cimp6.sc <- lapply(model.list.download, get_nc, model.var = "sos") %>% 
+  bind_rows
+
+#Historical data
+#salinity is "sos"
+data.cimp6.hist <- lapply(model.list.download, get_historical_nc, model.var = "sos") %>% 
+  bind_rows
+
+data.cimp6.table <- bind_rows(data.cimp6.hist, data.cimp6.sc)
+
+write_csv(data.cimp6.table, "data_cimp6_table.csv")
+                              
+system("az vm deallocate --name atlantisserver01 --no-wait --resource-group morzariacedogroup")
+
+```
+
+
+Combine multipart files into a single nc file
+```{r}
+
+# list of all files with gr: "data reported on a model's regular grid"
+model.files <- list.files("~/Puget_Sound_Downscaling/data_files", pattern = "*_gr_*.*nc$") 
+
+# list of unique models and scenarios
+model.scenarios <- list.files("~/Puget_Sound_Downscaling/data_files", pattern = "*_gr_*.*nc$") %>% 
+  str_split(.,"_gr") %>% 
+  unlist %>% 
+  #switch between sos and tos. You can do this manually here, then rerun. ( Note on 7/20/20)
+  grep("sos_Omon",., value = TRUE) %>% 
+  unique()
+
+data.path <- "~/Puget_Sound_Downscaling/data_files"
+save.path <- "~/Puget_Sound_Downscaling/combined_data_files"
+dir.create(save.path)
+
+lapply(model.scenarios,combine_files, model.files, save.path, data.path)
+
+
+```
+
+Regrid files into common, highest resolution grid, in this case we are using GFDL-OM4p25 as the base grid
+```{r}
+
+
+# model resolution
+# checked by opening nc file and printing open file 
+# open netCDF file
+# ncin <- nc_open(this.nc)
+# print(this.file) #lists basic info about file
+# GFDL-CM4 is ocean: GFDL-OM4p25 (GFDL-MOM6, tripolar - nominal 0.25 deg; 1440 x 1080 longitude/latitude; 75 levels; top grid cell 0-2 m)
+# CNRM-CM6-1-HR, ocean: Nemo 3.6 (eORCA025, tripolar primarily 1/4deg; 1442 x 1050 longitude/latitude
+
+data.path <- "~/Puget_Sound_Downscaling/combined_data_files"
+save.path <- "~/Puget_Sound_Downscaling/regridded_data_files"
+wgts.dir <- "~/Puget_Sound_Downscaling/wgts_files"
+#will create directory if it does not exist
+dir.create(save.path)
+dir.create(wgts.dir)
+
+# list of all files with gn: "data reported on a model's native grid"
+model.files <- list.files(path=data.path, pattern = "*.*nc$") 
+#switch variable here: sos or tos
+
+mclapply(model.files, regrid_nc, save.path, data.path, wgts.dir, resolution = "1440x1080")
+
+
+```
+
+
+Calculate the climatology, the long term average for all nc files
+- GFDL files were moved from combined_data_files to regridded_data_files
+```{r}
+
+data.path <- "~/Puget_Sound_Downscaling/regridded_data_files"
+save.path <- "~/Puget_Sound_Downscaling/climatology_files"
+#will create directory if it does not exist
+dir.create(save.path)
+
+# list of all regridded files
+model.files <- list.files(path=data.path, pattern = "*.*nc$") 
+
+# Calculate the number of cores
+NumberOfCluster <- detectCores() - 1
+
+# Initiate cluster
+cl <- makeCluster(NumberOfCluster)
+registerDoSNOW(cl)
+
+
+point.data <- foreach(this.file = model.files, .verbose=TRUE) %dopar% {
+  
+  .packages = c(
+    "tidyverse","ncdf4")
+  
+  if(length(.packages[!.inst]) > 0) install.packages(.packages[!.inst])
+  
+  # Load packages into session 
+  lapply(.packages, require, character.only=TRUE)
+  
+  stat.clim <- "mean"
+  
+  climatology_nc(this.file, stat.clim, data.path, save.path)
+  
+}
+
+
+```
+
+
+Calculate anomaly as the difference between the hindcast and the forecast
+```{r}
+
+data.path <- "~/Puget_Sound_Downscaling/climatology_files"
+save.path <- "~/Puget_Sound_Downscaling/anomaly_files"
+#will create directory if it does not exist
+dir.create(save.path)
+
+# list of unique climatology files
+models.cimp6 <- list.files(data.path, pattern = "ssp*.*_mean_*.*nc$") 
+historical.files <- list.files(data.path, pattern = "historical*.*_mean_*.*nc$")
+
+model.list <- c("CNRM-CM6-1-HR", "GFDL-CM4")
+
+model.vars <- c("tos","sos")
+
+
+lapply(model.list, anomaly_nc, models.cimp6, historical.files, model.vars)
+
+```
+
+
+Get SST from  NOAA OI SST V2 High Resolution Dataset: NOAA 1/4° daily Optimum Interpolation Sea Surface Temperature (or daily OISST) is an analysis constructed by combining observations from different platforms (satellites, ships, buoys, and Argo floats) on a regular global grid.
+Reference is Reynolds, Richard W., Thomas M. Smith, Chunying Liu, Dudley B. Chelton, Kenneth S. Casey, Michael G. Schlax, 2007: Daily High-Resolution-Blended Analyses for Sea Surface Temperature. J. Climate, 20, 5473-5496. Cite as "NOAA High Resolution SST data provided by the NOAA/OAR/ESRL PSL, Boulder, Colorado, USA, from their Web site at https://psl.noaa.gov/"
+
+```{r}
+system("wget ftp://ftp.cdc.noaa.gov/Datasets/noaa.oisst.v2.highres/sst.day.mean.ltm.1982-2010.nc", wait=TRUE)
+
+```
+
+Get SST and salinity from NOAA 2018 World Ocean Atlas Dataset, 1° grid
+
+```{r}
+system("wget https://data.nodc.noaa.gov/thredds/fileServer/ncei/woa/temperature/decav/0.25/woa18_decav_t00_04.nc", wait =TRUE)
+
+system("wget https://data.nodc.noaa.gov/thredds/fileServer/ncei/woa/salinity/decav/0.25/woa18_decav_s00_04.nc", wait=TRUE)
+```
+
+
+Get SST from RDA dataset ds548.0 - 'International Comprehensive Ocean-Atmosphere Data Set (ICOADS) Release 3, Individual Observations
+
+```{r}
+
+system("wget https://rda.ucar.edu/dsrqst/WALKER439286/ICOADS_R3.0_Rqst439286_19700101-19950422.csv.gz", wait=TRUE)
+```
+
+
+
+Interpolate values at 3km
+
+```{r}
+
+#GSHHS_f_L1 is layer imported from GIS with land shape. 
+
+landShape <- readOGR("~/Puget_Sound_Downscaling/landshape_shapefile/", "GSHHS_f_L1")
+
+# crop it to just puget sound, same as raster projection 
+extent.study <- extent(-130, -121.5, 46, 51.5)
+PugetSoundLandShape <- crop(landShape,extent.study)
+#creating empty raster with 3km cell resolution
+pred.raster <- raster(res=0.03)
+#constrain raster to Puget Sound area
+pred.raster.ext <- setExtent(pred.raster,extent.study,keepres = TRUE)
+#convert polygon to raster using empty raster
+PugetSoundRaster  <- rasterize(PugetSoundLandShape,pred.raster.ext,'level')
+PugetSoundRaster <- setExtent(PugetSoundRaster, extent.study,keepres = TRUE)
+plot(PugetSoundRaster)
+
+#switch land values to NA, ocean to 1
+PugetSoundRaster[is.na(PugetSoundRaster)] <- 2
+PugetSoundRaster[PugetSoundRaster==1] <- NA
+PugetSoundRaster[PugetSoundRaster==2] <- 1
+
+data.path <- "~/Puget_Sound_Downscaling/anomaly_files"
+save.path <- "~/Puget_Sound_Downscaling/3km_interpolated_files"
+dir.create(save.path)
+
+file.list <- list.files(data.path, pattern = "*.*nc$")
+lapply(file.list, InterpolateData,PugetSoundRaster,data.path,save.path)
+
+```
+
+Plot Interpolated SST Anomalies for Salish Sea
+```{r}
+data.path<- "~/Puget_Sound_Downscaling/3km_interpolated_files/"
+save.path<- "~/Puget_Sound_Downscaling/interpolated_anomaly_plots/"
+#will create directory if it does not exist
+dir.create(save.path)
+
+file.list <- list.files(data.path, pattern = "tos*.*.*asc$")
+
+lapply(file.list, plot_SSTanomaly,data.path,save.path)
+
+
+```
+
+Plot Interpolated Salinity Anomalies for Salish Sea
+```{r}
+data.path<- "~/Puget_Sound_Downscaling/3km_interpolated_files/"
+save.path<- "~/Puget_Sound_Downscaling/interpolated_anomaly_plots/"
+#will create directory if it does not exist
+dir.create(save.path)
+
+file.list <- list.files(data.path, pattern = "sos*.*.*asc$")
+
+lapply(file.list, plot_salinity_anomaly,data.path,save.path)
+
+```
+
+Plot Faceted Interpolated Anomaly Figure
+```{r}
+setwd("~/Puget_Sound_Downscaling/interpolated_anomaly_plots/")
+plot1 <- readPNG('sos_Omon_GFDL-CM4_ssp585_r1i1p1f1_anomaly_202001-205012_plot.png')
+plot2 <- readPNG('sos_Omon_GFDL-CM4_ssp585_r1i1p1f1_anomaly_207001-210012_plot.png')
+plot3 <- readPNG('tos_Omon_GFDL-CM4_ssp585_r1i1p1f1_anomaly_202001-205012_plot.png')
+plot4 <- readPNG('tos_Omon_GFDL-CM4_ssp585_r1i1p1f1_anomaly_207001-210012_plot.png')
+
+grid.combine <- grid.arrange(rasterGrob(plot1),rasterGrob(plot2),rasterGrob(plot3),rasterGrob(plot4),ncol=2)
+
+ggsave(grid.combine, filename = "Fig3_Salish_Sea_Interpolated_Anomalies.png", device = "png", path = "~/Puget_Sound_Downscaling/final_figures/", 
+       dpi = 100, width = 24, height = 20, units = "cm")
+
+```
+
+
+Interpolate 0.01 km anomalies
+
+```{r}
+
+
+#GSHHS_f_L1 is layer imported from GIS with land shape. 
+
+landShape <- readOGR("~/Puget_Sound_Downscaling/landshape_shapefile/", "GSHHS_f_L1")
+
+# crop it to just puget sound, same as raster projection 
+extent.study <- extent(-130, -121.5, 46, 51.5)
+PugetSoundLandShape <- crop(landShape,extent.study)
+ps.crs <- crs(PugetSoundLandShape)
+
+#creating empty raster with 3km cell resolution
+pred.raster <- raster(extent.study, res=0.001)
+PugetSoundRaster  <- rasterize(PugetSoundLandShape,pred.raster,'level')
+plot(PugetSoundRaster)
+
+#switch land values to NA, ocean to 1
+PugetSoundRaster[is.na(PugetSoundRaster)] <- 2
+PugetSoundRaster[PugetSoundRaster==1] <- NA
+PugetSoundRaster[PugetSoundRaster==2] <- 1
+
+data.path <- "~/Puget_Sound_Downscaling/anomaly_files"
+save.path <- "~/Puget_Sound_Downscaling/interpolated_files"
+dir.create(save.path)
+
+file.list <- list.files(data.path, pattern = "*.*nc$")
+
+#always check computer size
+NumberOfCluster <- detectCores() - 4
+
+# Initiate cluster
+cl <- makeCluster(NumberOfCluster)
+registerDoSNOW(cl)
+
+
+interpolated.data <- foreach(this.file = file.list, .verbose=TRUE) %dopar% {
+  
+  .packages = c("fields","ncdf4","sf","rgdal","raster","stringr")
+  
+  if(length(.packages[!.inst]) > 0) install.packages(.packages[!.inst])
+  
+  # Load packages into session 
+  lapply(.packages, require, character.only=TRUE)
+  
+  InterpolateData(this.file, PugetSoundRaster,data.path,save.path)
+  
+}
+
+
+```
+
+
+Take original ROMS time series and overlay anomalies
+
+```{r}
+
+setwd("~/Puget_Sound_Downscaling/Atlantis_shapefile/")
+PugetSoundAtlantisPolygons  <- readOGR(".","bgm_Puget_Sound_89b_0p0001_WGS84")
+#plot(PugetSoundAtlantisPolygons, add=TRUE)
+
+#temperature ROMS time series used to drive Atlantis
+# 2yr timeseries for 2005 and 2006, timestep is 12 hours 
+
+atlantis.temp.roms <- "pugetsound_roms_temp.nc"
+
+atlantis.salt.roms <- "pugetsound_roms_salt.nc"
+
+#dim(temperatureArray)
+#[1]    7   89 1460
+# Note this is layers 1-7,  listed as deepest to shallowest, then blanks, then sediemntn. See user manual. 
+
+#---------------
+# Need to get the number of depth layers for each of the 89 Atlantis polygons, and a count of total num polygons
+AtlantisBoxInfo <- read.csv(paste0("~/Puget_Sound_Downscaling/roms_forcing/","AtlantisBoxInfo.csv"))
+#AtlantisBoxInfo$num_layers
+#AtlantisBoxInfo$box_id
+
+data.path <- "~/Puget_Sound_Downscaling/interpolated_files"
+forcing.path <- "~/Puget_Sound_Downscaling/roms_forcing"
+
+save.path <- "~/Puget_Sound_Downscaling/overlay_files"
+dir.create(save.path)
+
+file.list <- list.files(data.path, pattern = "*.*asc$")
+
+ lapply(file.list,overlay_roms, PugetSoundAtlantisPolygons, AtlantisBoxInfo,atlantis.temp.roms, atlantis.salt.roms, data.path, save.path)
+  
+
+
+```
+
+Combining the ROMS time series to prepare for plotting
+```{r}
+
+data.path <- "~/Puget_Sound_Downscaling/overlay_files"
+save.path <- "~/Puget_Sound_Downscaling/"
+setwd(data.path)
+
+files.overlay <- list.files(data.path, pattern = "*.csv", full.names = TRUE) 
+
+get_file <- function(this.file) {
+  
+  file_data<- fread(this.file) %>%
+    as_tibble() %>%
+    mutate(file_name= gsub("/home/atlantis/Puget_Sound_Downscaling/overlay_files/", "", this.file)) %>%
+    mutate(boxIndex= boxIndex-1)# %>%
+    #mutate(day = timestep/2) %>%
+    #mutate(month = seq(as.Date("2005/1/1"), by = "day", length.out = 87600))
+
+  return(file_data)
+  
+}
+
+data.downscaled <- lapply(files.overlay, get_file) %>%
+  bind_rows()
+
+data.downscaled.table <- data.downscaled %>% 
+    separate(file_name,
+             into=c("variable",
+                    "realm",
+                    "model",
+                    "experiment",
+                    "realisation",
+                    "stat",
+                    "date"),
+             sep = "_")
+setwd("~/Puget_Sound_Downscaling/")
+write_csv(data.downscaled.table, "data_downscaled_table.csv")
+
+
+```
+
+Grouping downscaled data to prepare for plotting 
+```{r}
+
+data.downscaled.table<- read_csv("data_downscaled_table.csv")
+
+#including box
+box.SST.grouping <- data.downscaled.table %>%
+  group_by(variable, model, experiment, boxIndex, date) %>%
+  filter(variable=="tos") %>%
+  summarize(mean.roms_original = mean(roms_original), 
+            mean.roms_cimp6 = mean(roms_cimp6)) %>%
+  ungroup() %>%
+  mutate(term=if_else(date =="202001-205012roms.csv", "Short-term",
+                      if_else(date =="207001-210012roms.csv", "Long-term", "NA")))
+
+setwd("~/Puget_Sound_Downscaling/Atlantis_shapefile/")
+PugetSoundAtlantisPolygons  <-readOGR(".","bgm_Puget_Sound_89b_0p0001_WGS84")
+#plot(PugetSoundAtlantisPolygons, add=TRUE)
+library(broom)
+spdf_fortified <- tidy(PugetSoundAtlantisPolygons, region = "code")
+
+```
+
+Plotting final figures
+```{r}
+
+setwd("~/Puget_Sound_Downscaling/")
+
+#Figure 4 - plots SST 4 panel figure showing average temporal change for each scenario, model, and term
+source("plot_SST_scenarios.R")
+
+#Figure 5 - plots salinity 4 panel figure showing average temporal change for each scenario, model, and term
+source("plot_salinity_scenarios.R")
+
+#plots a scenario example of variability between models
+source("plot_model_variability.R")
+
+#plots an example of regional salinity differences in both terms
+source("plot_salinity_chloropleth.R")
+
+#faceting chloropleth figures
+grid.combine <- grid.arrange(SSTmodel.map2, SSTmodel.map1, SALmodel.map2, SALmodel.map1, ncol =2, nrow=2)
+ggsave(grid.combine, filename = "Fig7_combined_choropleth.png", device = "png", path = save.path, 
+       dpi = 100, width = 24, height = 20, units = "cm")
+```
+Plotting choropleth figures
+```{r}
+
+#creates SST choropleth figures
+source('~/Puget_Sound_Downscaling/make_SST_choropleth.R')
+
+#creates salinity choropleth figures
+source('~/Puget_Sound_Downscaling/make_salinity_chloropleth.R')
+
+#set directory and load data.downscaled.table
+setwd("~/Puget_Sound_Downscaling/")
+data.downscaled.table <- fread("data_downscaled_table.csv")
+
+#GFDL ssp585 SST (labeled differently because these are for Figure 7)
+make_SST_chloropleth(data.downscaled.table, model.type = "GFDL-CM4", experiment.type ="ssp585", 
+                 plot.filename1="SST_long.term_choropleth.png", plot.filename2 = "SST_short-term_choropleth.png",
+                 combined.filename="SST_combined_choropleth.png", save.path = "~/Puget_Sound_Downscaling/final_figures/")
+
+#GFDL ssp585 salinity (labeled differently because these are for Figure 7)
+make_salinity_chloropleth(data.downscaled.table, model.type = "GFDL-CM4", experiment.type ="ssp585", plot.filename1="salinity_long.term_choropleth.png", plot.filename2 = "salinity_short-term_choropleth.png", combined.filename="salinity_combined_choropleth.png", save.path = "~/Puget_Sound_Downscaling/final_figures/")
+
+#GFDL ssp245 SST
+model.type= "GFDL-CM4"
+experiment.type = "ssp245"
+make_SST_chloropleth(data.downscaled.table, model.type = "GFDL-CM4", experiment.type ="ssp245", 
+                 plot.filename1= paste0("SST_long-term_choropleth_",model.type,"_",experiment.type,".png"), plot.filename2 = paste0("SST_short-term_choropleth_",model.type,"_",experiment.type,".png"),
+                 combined.filename= paste0("SST_combined_choropleth_",model.type,"_",experiment.type,".png" ), save.path = "~/Puget_Sound_Downscaling/final_figures/")
+
+#GFDL ssp245 salinity
+model.type= "GFDL-CM4"
+experiment.type = "ssp245"
+make_salinity_chloropleth(data.downscaled.table, model.type = "GFDL-CM4", experiment.type ="ssp245", 
+                     plot.filename1=paste0("salinity_long-term_choropleth_",model.type,"_",experiment.type,".png"), plot.filename2 = paste0("salinity_short-term_choropleth_",model.type,"_",experiment.type,".png"),
+                     combined.filename=paste0("salinity_combined_choropleth_",model.type,"_",experiment.type,".png"), save.path = "~/Puget_Sound_Downscaling/final_figures/")
+
+#CNRM ssp126 SST
+model.type = "CNRM-CM6-1-HR"
+experiment.type = "ssp126"
+make_SST_chloropleth(data.downscaled.table, model.type = "CNRM-CM6-1-HR", experiment.type ="ssp126", 
+                 plot.filename1=paste0("SST_long-term_choropleth_",model.type,"_",experiment.type,".png"), plot.filename2 =paste0("SST_short-term_choropleth_",model.type,"_",experiment.type,".png"),
+                combined.filename=paste0("SST_combined_choropleth_",model.type,"_",experiment.type,".png"), save.path = "~/Puget_Sound_Downscaling/final_figures/")
+
+#CNRM ssp126 salinity
+model.type = "CNRM-CM6-1-HR"
+experiment.type = "ssp126"
+make_salinity_chloropleth(data.downscaled.table, model.type = "CNRM-CM6-1-HR", experiment.type ="ssp126", 
+                 plot.filename1=paste0("salinity_long-term_choropleth_",model.type,"_",experiment.type,".png"), plot.filename2 =paste0("salinity_short-term_choropleth_",model.type,"_",experiment.type,".png"),
+                combined.filename=paste0("salinity_combined_choropleth_",model.type,"_",experiment.type,".png"), save.path = "~/Puget_Sound_Downscaling/final_figures/")
+
+#CNRM ssp245 SST
+model.type = "CNRM-CM6-1-HR"
+experiment.type = "ssp245"
+make_SST_chloropleth(data.downscaled.table, model.type = "CNRM-CM6-1-HR", experiment.type ="ssp245", 
+                 plot.filename1=paste0("SST_long-term_choropleth_",model.type,"_",experiment.type,".png"), plot.filename2 =paste0("SST_short-term_choropleth_",model.type,"_",experiment.type,".png"),
+                combined.filename=paste0("SST_combined_choropleth_",model.type,"_",experiment.type,".png"), save.path = "~/Puget_Sound_Downscaling/final_figures/")
+
+#CNRM ssp245 salinity
+model.type = "CNRM-CM6-1-HR"
+experiment.type = "ssp245"
+make_salinity_chloropleth(data.downscaled.table, model.type = "CNRM-CM6-1-HR", experiment.type ="ssp245", 
+                 plot.filename1=paste0("salinity_long.term_choropleth_",model.type,"_",experiment.type,".png"), plot.filename2 =paste0("salinity_short-term_choropleth_",model.type,"_",experiment.type,".png"),
+                combined.filename=paste0("salinity_combined_choropleth_",model.type,"_",experiment.type,".png"), save.path = "~/Puget_Sound_Downscaling/final_figures/")
+
+#CNRM ssp370 SST
+model.type = "CNRM-CM6-1-HR"
+experiment.type = "ssp370"
+make_SST_chloropleth(data.downscaled.table, model.type = "CNRM-CM6-1-HR", experiment.type ="ssp370", 
+                 plot.filename1=paste0("SST_long.term_choropleth_",model.type,"_",experiment.type,".png"), plot.filename2 =paste0("SST_short-term_choropleth_",model.type,"_",experiment.type,".png"),
+                combined.filename=paste0("SST_combined_choropleth_",model.type,"_",experiment.type,".png"), save.path = "~/Puget_Sound_Downscaling/final_figures/")
+
+#CNRM ssp370 salinity
+model.type = "CNRM-CM6-1-HR"
+experiment.type = "ssp370"
+make_salinity_chloropleth(data.downscaled.table, model.type = "CNRM-CM6-1-HR", experiment.type ="ssp370", 
+                 plot.filename1=paste0("salinity_long.term_choropleth_",model.type,"_",experiment.type,".png"), plot.filename2 =paste0("salinity_short-term_choropleth_",model.type,"_",experiment.type,".png"),
+                combined.filename=paste0("salinity_combined_choropleth_",model.type,"_",experiment.type,".png"), save.path = "~/Puget_Sound_Downscaling/final_figures/")
+
+#CNRM ssp585 SST
+model.type = "CNRM-CM6-1-HR"
+experiment.type = "ssp585"
+make_SST_chloropleth(data.downscaled.table, model.type = "CNRM-CM6-1-HR", experiment.type ="ssp585", 
+                 plot.filename1=paste0("SST_long.term_choropleth_",model.type,"_",experiment.type,".png"), plot.filename2 =paste0("SST_short-term_choropleth_",model.type,"_",experiment.type,".png"),
+                combined.filename=paste0("SST_combined_choropleth_",model.type,"_",experiment.type,".png"), save.path = "~/Puget_Sound_Downscaling/final_figures/")
+
+#CNRM ssp585 salinity
+model.type = "CNRM-CM6-1-HR"
+experiment.type = "ssp585"
+make_salinity_chloropleth(data.downscaled.table, model.type = "CNRM-CM6-1-HR", experiment.type ="ssp585", 
+                 plot.filename1=paste0("salinity_long.term_choropleth_",model.type,"_",experiment.type,".png"), plot.filename2 =paste0("salinity_short-term_choropleth_",model.type,"_",experiment.type,".png"),
+                combined.filename=paste0("salinity_combined_choropleth_",model.type,"_",experiment.type,".png"), save.path = "~/Puget_Sound_Downscaling/final_figures/")
+```
+Faceting choropleth figures (Fig 7)
+```{r}
+setwd("~/Puget_Sound_Downscaling/final_figures/")
+save.path <- "~/Puget_Sound_Downscaling/final_figures/"
+
+#combining GFDL ssp585
+SST_combined <-readPNG('SST_combined_choropleth.png')
+salinity_combined <- readPNG('salinity_combined_choropleth.png')
+
+grid.combine <- grid.arrange(rasterGrob(SST_combined),rasterGrob(salinity_combined),nrow=2)
+
+ggsave(grid.combine, filename = "Fig7_combined_choropleth.png", device = "png", path = save.path, 
+       dpi = 100, width = 24, height = 20, units = "cm")
+
+#combining GFDL ssp245
+SST_combined <-readPNG('SST_combined_choropleth_GFDL-CM4_ssp245.png')
+salinity_combined <- readPNG('salinity_combined_choropleth_GFDL-CM4_ssp245.png')
+
+grid.combine <- grid.arrange(rasterGrob(SST_combined),rasterGrob(salinity_combined),nrow=2)
+
+ggsave(grid.combine, filename = "GFDL_ssp245_SST_salinity_combined_choropleth.png", device = "png", path = save.path, 
+       dpi = 100, width = 24, height = 20, units = "cm")
+
+#combining CNRM ssp126
+SST_combined <-readPNG('SST_combined_choropleth_CNRM-CM6-1-HR_ssp126.png')
+salinity_combined <- readPNG('salinity_combined_choropleth_CNRM-CM6-1-HR_ssp126.png')
+
+grid.combine <- grid.arrange(rasterGrob(SST_combined),rasterGrob(salinity_combined),nrow=2)
+
+ggsave(grid.combine, filename = "CNRM-CM6-1-HR_ssp126_SST_salinity_combined_choropleth.png", device = "png", path = save.path, 
+       dpi = 100, width = 24, height = 20, units = "cm")
+
+#combining CNRM ssp245
+SST_combined <-readPNG('SST_combined_choropleth_CNRM-CM6-1-HR_ssp245.png')
+salinity_combined <- readPNG('salinity_combined_choropleth_CNRM-CM6-1-HR_ssp245.png')
+
+grid.combine <- grid.arrange(rasterGrob(SST_combined),rasterGrob(salinity_combined),nrow=2)
+
+ggsave(grid.combine, filename = "CNRM-CM6-1-HR_ssp245_SST_salinity_combined_choropleth.png", device = "png", path = save.path, 
+       dpi = 100, width = 24, height = 20, units = "cm")
+
+#combing CNRM ssp370
+SST_combined <-readPNG('SST_combined_choropleth_CNRM-CM6-1-HR_ssp370.png')
+salinity_combined <- readPNG('salinity_combined_choropleth_CNRM-CM6-1-HR_ssp370.png')
+
+grid.combine <- grid.arrange(rasterGrob(SST_combined),rasterGrob(salinity_combined),nrow=2)
+
+ggsave(grid.combine, filename = "CNRM-CM6-1-HR_ssp370_SST_salinity_combined_choropleth.png", device = "png", path = save.path, 
+       dpi = 100, width = 24, height = 20, units = "cm")
+
+#combining CNRM ssp585
+SST_combined <-readPNG('SST_combined_choropleth_CNRM-CM6-1-HR_ssp585.png')
+salinity_combined <- readPNG('salinity_combined_choropleth_CNRM-CM6-1-HR_ssp585.png')
+
+grid.combine <- grid.arrange(rasterGrob(SST_combined),rasterGrob(salinity_combined),nrow=2)
+
+ggsave(grid.combine, filename = "CNRM-CM6-1-HR_ssp585_SST_salinity_combined_choropleth.png", device = "png", path = save.path, 
+       dpi = 100, width = 24, height = 20, units = "cm")
+```
+
+Faceting SST interpolated anomaly figures for supplementary material
+```{r}
+setwd("~/Puget_Sound_Downscaling/interpolated_anomaly_plots/")
+save.path <- "~/Puget_Sound_Downscaling/final_figures/faceted_interpolated_anomalies/"
+
+#combining GFDL ssp585 SST
+long.term <-readPNG('tos_Omon_GFDL-CM4_ssp585_r1i1p1f1_anomaly_207001-210012_plot.png')
+short.term <- readPNG('tos_Omon_GFDL-CM4_ssp585_r1i1p1f1_anomaly_202001-205012_plot.png')
+
+grid.combine <- grid.arrange(rasterGrob(short.term),rasterGrob(long.term),ncol=2)
+
+ggsave(grid.combine, filename = "SST_interpolated_anomaly_combined_GFDL-CM4_ssp585.png", device = "png", path = save.path, 
+       dpi = 150, width = 13, height = 11, units = "cm")
+
+#combining GFDL ssp245 SST
+long.term <-readPNG('tos_Omon_GFDL-CM4_ssp245_r1i1p1f1_anomaly_207001-210012_plot.png')
+short.term <- readPNG('tos_Omon_GFDL-CM4_ssp245_r1i1p1f1_anomaly_202001-205012_plot.png')
+
+grid.combine <- grid.arrange(rasterGrob(short.term),rasterGrob(long.term),ncol=2)
+
+ggsave(grid.combine, filename = "SST_interpolated_anomaly_combined_GFDL-CM4_ssp245.png", device = "png", path = save.path, 
+       dpi = 150, width = 13, height = 11, units = "cm")
+
+#combining CNRM ssp585 SST
+long.term <-readPNG('tos_Omon_CNRM-CM6-1-HR_ssp585_r1i1p1f2_anomaly_207001-210012_plot.png')
+short.term <- readPNG('tos_Omon_CNRM-CM6-1-HR_ssp585_r1i1p1f2_anomaly_202001-205012_plot.png')
+
+grid.combine <- grid.arrange(rasterGrob(short.term),rasterGrob(long.term),ncol=2)
+
+ggsave(grid.combine, filename = "SST_interpolated_anomaly_combined_CNRM-CM6-1-HR_ssp585.png", device = "png", path = save.path, 
+       dpi = 150, width = 13, height = 11, units = "cm")
+
+#combining CNRM ssp370 SST
+long.term <-readPNG('tos_Omon_CNRM-CM6-1-HR_ssp370_r1i1p1f2_anomaly_207001-210012_plot.png')
+short.term <- readPNG('tos_Omon_CNRM-CM6-1-HR_ssp370_r1i1p1f2_anomaly_202001-205012_plot.png')
+
+grid.combine <- grid.arrange(rasterGrob(short.term),rasterGrob(long.term),ncol=2)
+
+ggsave(grid.combine, filename = "SST_interpolated_anomaly_combined_CNRM-CM6-1-HR_ssp370.png", device = "png", path = save.path, 
+       dpi = 150, width = 13, height = 11, units = "cm")
+
+#combining CNRM ssp245 SST
+long.term <-readPNG('tos_Omon_CNRM-CM6-1-HR_ssp245_r1i1p1f2_anomaly_207001-210012_plot.png')
+short.term <- readPNG('tos_Omon_CNRM-CM6-1-HR_ssp245_r1i1p1f2_anomaly_202001-205012_plot.png')
+
+grid.combine <- grid.arrange(rasterGrob(short.term),rasterGrob(long.term),ncol=2)
+
+ggsave(grid.combine, filename = "SST_interpolated_anomaly_combined_CNRM-CM6-1-HR_ssp245.png", device = "png", path = save.path, 
+       dpi = 150, width = 13, height = 11, units = "cm")
+
+#combining CNRM ssp126 SST
+long.term <-readPNG('tos_Omon_CNRM-CM6-1-HR_ssp126_r1i1p1f2_anomaly_207001-210012_plot.png')
+short.term <- readPNG('tos_Omon_CNRM-CM6-1-HR_ssp126_r1i1p1f2_anomaly_202001-205012_plot.png')
+
+grid.combine <- grid.arrange(rasterGrob(short.term),rasterGrob(long.term),ncol=2)
+
+ggsave(grid.combine, filename = "SST_interpolated_anomaly_combined_CNRM-CM6-1-HR_ssp126.png", device = "png", path = save.path, 
+       dpi = 150, width = 13, height = 11, units = "cm")
+
+```
+
+Faceting salinity interpolated anomaly figures for supplementary material
+```{r}
+setwd("~/Puget_Sound_Downscaling/interpolated_anomaly_plots/")
+save.path <- "~/Puget_Sound_Downscaling/final_figures/faceted_interpolated_anomalies/"
+
+#combining GFDL ssp585 salinity
+long.term <-readPNG('sos_Omon_GFDL-CM4_ssp585_r1i1p1f1_anomaly_207001-210012_plot.png')
+short.term <- readPNG('sos_Omon_GFDL-CM4_ssp585_r1i1p1f1_anomaly_202001-205012_plot.png')
+
+grid.combine <- grid.arrange(rasterGrob(short.term),rasterGrob(long.term),ncol=2)
+
+ggsave(grid.combine, filename = "salinity_interpolated_anomaly_combined_GFDL-CM4_ssp585.png", device = "png", path = save.path, 
+       dpi = 150, width = 13, height = 11, units = "cm")
+
+#combining GFDL ssp245 salinity
+long.term <-readPNG('sos_Omon_GFDL-CM4_ssp245_r1i1p1f1_anomaly_207001-210012_plot.png')
+short.term <- readPNG('sos_Omon_GFDL-CM4_ssp245_r1i1p1f1_anomaly_202001-205012_plot.png')
+
+grid.combine <- grid.arrange(rasterGrob(short.term),rasterGrob(long.term),ncol=2)
+
+ggsave(grid.combine, filename = "salinity_interpolated_anomaly_combined_GFDL-CM4_ssp245.png", device = "png", path = save.path, 
+       dpi = 150, width = 13, height = 11, units = "cm")
+
+#combining CNRM ssp585 salinity
+long.term <-readPNG('sos_Omon_CNRM-CM6-1-HR_ssp585_r1i1p1f2_anomaly_207001-210012_plot.png')
+short.term <- readPNG('sos_Omon_CNRM-CM6-1-HR_ssp585_r1i1p1f2_anomaly_202001-205012_plot.png')
+
+grid.combine <- grid.arrange(rasterGrob(short.term),rasterGrob(long.term),ncol=2)
+
+ggsave(grid.combine, filename = "salinity_interpolated_anomaly_combined_CNRM-CM6-1-HR_ssp585.png", device = "png", path = save.path, 
+       dpi = 150, width = 13, height = 11, units = "cm")
+
+#combining CNRM ssp370 salinity
+long.term <-readPNG('sos_Omon_CNRM-CM6-1-HR_ssp370_r1i1p1f2_anomaly_207001-210012_plot.png')
+short.term <- readPNG('sos_Omon_CNRM-CM6-1-HR_ssp370_r1i1p1f2_anomaly_202001-205012_plot.png')
+
+grid.combine <- grid.arrange(rasterGrob(short.term),rasterGrob(long.term),ncol=2)
+
+ggsave(grid.combine, filename = "salinity_interpolated_anomaly_combined_CNRM-CM6-1-HR_ssp370.png", device = "png", path = save.path, 
+       dpi = 150, width = 13, height = 11, units = "cm")
+
+#combining CNRM ssp245 salinity
+long.term <-readPNG('sos_Omon_CNRM-CM6-1-HR_ssp245_r1i1p1f2_anomaly_207001-210012_plot.png')
+short.term <- readPNG('sos_Omon_CNRM-CM6-1-HR_ssp245_r1i1p1f2_anomaly_202001-205012_plot.png')
+
+grid.combine <- grid.arrange(rasterGrob(short.term),rasterGrob(long.term),ncol=2)
+
+ggsave(grid.combine, filename = "salinity_interpolated_anomaly_combined_CNRM-CM6-1-HR_ssp245.png", device = "png", path = save.path, 
+       dpi = 150, width = 13, height = 11, units = "cm")
+
+#combining CNRM ssp126 salinity
+long.term <-readPNG('sos_Omon_CNRM-CM6-1-HR_ssp126_r1i1p1f2_anomaly_207001-210012_plot.png')
+short.term <- readPNG('sos_Omon_CNRM-CM6-1-HR_ssp126_r1i1p1f2_anomaly_202001-205012_plot.png')
+
+grid.combine <- grid.arrange(rasterGrob(short.term),rasterGrob(long.term),ncol=2)
+
+ggsave(grid.combine, filename = "salinity_interpolated_anomaly_combined_CNRM-CM6-1-HR_ssp126.png", device = "png", path = save.path, 
+       dpi = 150, width = 13, height = 11, units = "cm")
+
+```
+
+Faceting resolution images for supplementary material
+```{r}
+setwd("~/Puget_Sound_Downscaling/resolution_images/")
+save.path <- "~/Puget_Sound_Downscaling/final_figures/"
+
+CNRM.res <- ReadPNG('CNRM-CM6-1-HR_resolution.png')
+GFDL.res <- ReadPNG('GFDL-CM4_resolution.png')
+
+grid.combine <- grid.arrange(rasterGrob(CNRM.res),rasterGrob(GFDL.res),ncol=2)
+
+ggsave(grid.combine, filename = "original_GCM_grid_resolution_combined.png", device = "png", path = save.path, 
+       dpi = 150, width = 13, height = 11, units = "cm")
+
+```
+
